@@ -12,6 +12,9 @@ jobs:
   notify:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,3 +32,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python notify.py
+
+      - name: Commit updated price cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add prices.json
+          git diff --cached --quiet || git commit -m "chore: update price cache [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          git push
