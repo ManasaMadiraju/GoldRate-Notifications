@@ -61,16 +61,21 @@ def fetch_inr_spot_24k() -> float:
     return round(r.json()["items"][0]["xauPrice"] / TROY_OZ_TO_GRAM, 2)
 
 
+_IST = pytz.timezone("Asia/Kolkata")
+
+
 def _lalithaa_price_if_fresh(entry: dict, max_days: int = 3) -> float | None:
     """Return the price only if rate_datetime is within max_days, else None."""
     rate_dt = entry.get("rate_datetime", "")
     if not rate_dt:
         return None
     try:
-        updated = datetime.fromisoformat(rate_dt)
-        if (datetime.utcnow() - updated).days <= max_days:
+        # Lalithaa timestamps are naive IST; localize before comparing with UTC
+        updated = _IST.localize(datetime.fromisoformat(rate_dt))
+        age = datetime.now(pytz.utc) - updated
+        if age.days <= max_days:
             return entry["price"]
-    except ValueError:
+    except (ValueError, Exception):
         pass
     return None
 
@@ -138,7 +143,7 @@ def save_cache(history: list):
         by_date[e["date"]] = e
     cutoff = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
     cleaned = sorted([e for e in by_date.values() if e["date"] >= cutoff], key=lambda e: e["date"])
-    CACHE_FILE.write_text(json.dumps(cleaned, indent=2))
+    CACHE_FILE.write_text(json.dumps(cleaned, indent=2) + "\n")
 
 
 def ensure_seeded(history: list) -> list:
@@ -146,15 +151,19 @@ def ensure_seeded(history: list) -> list:
     if len(history) >= 30:
         return history
     print("  [INFO] Seeding price history from Yahoo Finance...")
-    yahoo = fetch_yahoo_history(60)
-    merged = {e["date"]: e for e in history}
-    for e in yahoo:
-        if e["date"] not in merged:
-            merged[e["date"]] = e
-    result = sorted(merged.values(), key=lambda e: e["date"])
-    save_cache(result)
-    print(f"  [INFO] Cache seeded with {len(result)} days of data.")
-    return result
+    try:
+        yahoo = fetch_yahoo_history(60)
+        merged = {e["date"]: e for e in history}
+        for e in yahoo:
+            if e["date"] not in merged:
+                merged[e["date"]] = e
+        result = sorted(merged.values(), key=lambda e: e["date"])
+        save_cache(result)
+        print(f"  [INFO] Cache seeded with {len(result)} days of data.")
+        return result
+    except Exception as e:
+        print(f"  [WARN] Yahoo Finance seeding failed: {e}. Proceeding with {len(history)} days of history.")
+        return history
 
 
 def closest_entry(history: list, days_ago: int) -> dict | None:
@@ -226,7 +235,7 @@ def build_trend_signal(history: list, current_oz: float) -> dict:
     volatility = avg_daily_volatility(recent)
 
     # Trend direction from MA crossover
-    if ma7 and ma30:
+    if ma7 is not None and ma30 is not None:
         if ma7 > ma30 * 1.001:
             direction, signal = "Bullish", "▲"
         elif ma7 < ma30 * 0.999:
@@ -316,31 +325,39 @@ def send_telegram(message: str):
 
 def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching gold prices...")
+    try:
+        usd = fetch_usd_spot()
+        inr_24k = fetch_inr_spot_24k()
+        inr_22k, inr_22k_source = fetch_lalithaa_22k(inr_24k_spot=inr_24k)
 
-    usd = fetch_usd_spot()
-    inr_24k = fetch_inr_spot_24k()
-    inr_22k, inr_22k_source = fetch_lalithaa_22k(inr_24k_spot=inr_24k)
+        print(f"  1 oz      — ${usd['per_oz']:,}")
+        print(f"  USA       — 22K: ${usd['22K']}, 24K: ${usd['24K']}")
+        print(f"  Telangana — 22K: \u20b9{inr_22k:,} ({inr_22k_source}), 24K: \u20b9{inr_24k:,}")
 
-    print(f"  1 oz      — ${usd['per_oz']:,}")
-    print(f"  USA       — 22K: ${usd['22K']}, 24K: ${usd['24K']}")
-    print(f"  Telangana — 22K: \u20b9{inr_22k:,} ({inr_22k_source}), 24K: \u20b9{inr_24k:,}")
+        history = load_cache()
+        history = ensure_seeded(history)
 
-    history = load_cache()
-    history = ensure_seeded(history)
+        trend = build_trend_signal(history, usd["per_oz"])
+        print(f"  Trend     — {trend['signal']} {trend['direction']}, est. ${trend['tomorrow_low']:,}–${trend['tomorrow_high']:,}/oz tomorrow")
 
-    trend = build_trend_signal(history, usd["per_oz"])
-    print(f"  Trend     — {trend['signal']} {trend['direction']}, est. ${trend['tomorrow_low']:,}–${trend['tomorrow_high']:,}/oz tomorrow")
+        message = format_message(usd, inr_22k, inr_22k_source, inr_24k, trend)
 
-    message = format_message(usd, inr_22k, inr_22k_source, inr_24k, trend)
+        # Append today's price to cache (once per day)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if not any(e["date"] == today for e in history):
+            history.append({"date": today, "usd_per_oz": usd["per_oz"]})
+            save_cache(history)
 
-    # Append today's price to cache (once per day)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if not any(e["date"] == today for e in history):
-        history.append({"date": today, "usd_per_oz": usd["per_oz"]})
-        save_cache(history)
+        result = send_telegram(message)
+        print(f"  Telegram message sent (id={result['result']['message_id']})")
 
-    result = send_telegram(message)
-    print(f"  Telegram message sent (id={result['result']['message_id']})")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        try:
+            send_telegram(f"\u26a0\ufe0f Gold rate notification failed:\n`{e}`")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
