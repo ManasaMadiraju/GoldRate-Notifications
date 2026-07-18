@@ -61,14 +61,45 @@ def fetch_inr_spot_24k() -> float:
     return round(r.json()["items"][0]["xauPrice"] / TROY_OZ_TO_GRAM, 2)
 
 
-def fetch_lalithaa_22k() -> float:
+def _lalithaa_price_if_fresh(entry: dict, max_days: int = 3) -> float | None:
+    """Return the price only if rate_datetime is within max_days, else None."""
+    rate_dt = entry.get("rate_datetime", "")
+    if not rate_dt:
+        return None
+    try:
+        updated = datetime.fromisoformat(rate_dt)
+        if (datetime.utcnow() - updated).days <= max_days:
+            return entry["price"]
+    except ValueError:
+        pass
+    return None
+
+
+def fetch_lalithaa_22k(inr_24k_spot: float | None = None) -> tuple[float, str]:
+    """Returns (price, source_label)."""
     r = requests.get(
         f"https://api.lalithaajewellery.com/public/pricings/latest?state_id={TELANGANA_STATE_ID}",
         headers={**HEADERS, "Referer": "https://www.lalithaajewellery.com/", "Origin": "https://www.lalithaajewellery.com"},
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()["data"]["prices"]["gold"]["price"]
+    prices = r.json()["data"]["prices"]
+
+    if "gold_22kt" in prices:
+        price = _lalithaa_price_if_fresh(prices["gold_22kt"])
+        if price is not None:
+            return price, "Lalithaa Jewellery"
+
+    if "gold" in prices:
+        price = _lalithaa_price_if_fresh(prices["gold"])
+        if price is not None:
+            return price, "Lalithaa Jewellery"
+
+    # Both Lalithaa fields are stale — derive from live INR spot
+    if inr_24k_spot is not None:
+        return round(inr_24k_spot * 22 / 24, 2), "spot (Lalithaa stale)"
+
+    raise ValueError("Lalithaa API data is stale and no INR spot fallback available")
 
 
 # ── Historical data (seed) ────────────────────────────────────────────────────
@@ -230,7 +261,7 @@ def _chg(change: float | None, pct: float | None, symbol: str = "") -> str:
     return f"{arrow} {sign}{symbol}{change:,.2f} ({sign}{pct:.2f}%)"
 
 
-def format_message(usd: dict, inr_22k: float, inr_24k: float, trend: dict) -> str:
+def format_message(usd: dict, inr_22k: float, inr_22k_source: str, inr_24k: float, trend: dict) -> str:
     pst = pytz.timezone("America/Los_Angeles")
     ist = pytz.timezone("Asia/Kolkata")
     now_pst = datetime.now(pst)
@@ -254,7 +285,7 @@ def format_message(usd: dict, inr_22k: float, inr_24k: float, trend: dict) -> st
         f"  24K \u2192 `${usd['24K']:.2f}`",
         "",
         f"\U0001f1ee\U0001f1f3 *Telangana* (per gram)",
-        f"  22K \u2192 `\u20b9{inr_22k:,.2f}` _\u2014 Lalithaa Jewellery_",
+        f"  22K \u2192 `\u20b9{inr_22k:,.2f}` _\u2014 {inr_22k_source}_",
         f"  24K \u2192 `\u20b9{inr_24k:,.2f}` _\u2014 spot_",
         "",
         f"\U0001f4ca *Trend Signal*",
@@ -287,12 +318,12 @@ def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching gold prices...")
 
     usd = fetch_usd_spot()
-    inr_22k = fetch_lalithaa_22k()
     inr_24k = fetch_inr_spot_24k()
+    inr_22k, inr_22k_source = fetch_lalithaa_22k(inr_24k_spot=inr_24k)
 
     print(f"  1 oz      — ${usd['per_oz']:,}")
     print(f"  USA       — 22K: ${usd['22K']}, 24K: ${usd['24K']}")
-    print(f"  Telangana — 22K: \u20b9{inr_22k:,}, 24K: \u20b9{inr_24k:,}")
+    print(f"  Telangana — 22K: \u20b9{inr_22k:,} ({inr_22k_source}), 24K: \u20b9{inr_24k:,}")
 
     history = load_cache()
     history = ensure_seeded(history)
@@ -300,7 +331,7 @@ def main():
     trend = build_trend_signal(history, usd["per_oz"])
     print(f"  Trend     — {trend['signal']} {trend['direction']}, est. ${trend['tomorrow_low']:,}–${trend['tomorrow_high']:,}/oz tomorrow")
 
-    message = format_message(usd, inr_22k, inr_24k, trend)
+    message = format_message(usd, inr_22k, inr_22k_source, inr_24k, trend)
 
     # Append today's price to cache (once per day)
     today = datetime.utcnow().strftime("%Y-%m-%d")
